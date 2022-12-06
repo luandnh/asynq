@@ -154,5 +154,17 @@ func NotFound(ctx context.Context, task *Task) error {
 	return fmt.Errorf("handler not found for task %q", task.Type())
 }
 
-// NotFoundHandler returns a simple task handler that returns a ``not found`` error.
+// NotFoundHandler returns a simple task handler that returns a “not found“ error.
 func NotFoundHandler() Handler { return HandlerFunc(NotFound) }
+
+// GetType dispatches the task to the handler whose
+// pattern most closely matches the task type.
+func (mux *ServeMux) GetType() string {
+	return "handler"
+}
+
+// GetKey dispatches the task to the handler whose
+// pattern most closely matches the task type.
+func (mux *ServeMux) GetKey() string {
+	return ""
+}
