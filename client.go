@@ -11,10 +11,10 @@ import (
 	"time"
 
 	"github.com/go-redis/redis/v8"
-	"github.com/google/uuid"
 	"github.com/hibiken/asynq/internal/base"
 	"github.com/hibiken/asynq/internal/errors"
 	"github.com/hibiken/asynq/internal/rdb"
+	"github.com/rs/xid"
 )
 
 // A Client is responsible for scheduling tasks.
@@ -34,6 +34,15 @@ func NewClient(r RedisConnOpt) *Client {
 		panic(fmt.Sprintf("asynq: unsupported RedisConnOpt type %T", r))
 	}
 	return &Client{broker: rdb.NewRDB(c)}
+}
+
+// NewClientFromRDB returns a new Client instance given a redis connection option.
+func NewClientFromRDB(rd *rdb.RDB) *Client {
+	return &Client{broker: rd}
+}
+
+func (c *Client) Broker() base.Broker {
+	return c.broker
 }
 
 type OptionType int
@@ -60,13 +69,14 @@ type Option interface {
 	Type() OptionType
 
 	// Value returns a value used to create this option.
-	Value() interface{}
+	Value() any
 }
 
 // Internal option representations.
 type (
 	retryOption     int
 	queueOption     string
+	flowIDOption    string
 	taskIDOption    string
 	timeoutOption   time.Duration
 	deadlineOption  time.Time
@@ -88,27 +98,36 @@ func MaxRetry(n int) Option {
 	return retryOption(n)
 }
 
-func (n retryOption) String() string     { return fmt.Sprintf("MaxRetry(%d)", int(n)) }
-func (n retryOption) Type() OptionType   { return MaxRetryOpt }
-func (n retryOption) Value() interface{} { return int(n) }
+func (n retryOption) String() string   { return fmt.Sprintf("MaxRetry(%d)", int(n)) }
+func (n retryOption) Type() OptionType { return MaxRetryOpt }
+func (n retryOption) Value() any       { return int(n) }
 
 // Queue returns an option to specify the queue to enqueue the task into.
 func Queue(name string) Option {
 	return queueOption(name)
 }
 
-func (name queueOption) String() string     { return fmt.Sprintf("Queue(%q)", string(name)) }
-func (name queueOption) Type() OptionType   { return QueueOpt }
-func (name queueOption) Value() interface{} { return string(name) }
+func (name queueOption) String() string   { return fmt.Sprintf("Queue(%q)", string(name)) }
+func (name queueOption) Type() OptionType { return QueueOpt }
+func (name queueOption) Value() any       { return string(name) }
+
+// FlowID returns an option to specify the queue to enqueue the task into.
+func FlowID(name string) Option {
+	return flowIDOption(name)
+}
+
+func (name flowIDOption) String() string   { return string(name) }
+func (name flowIDOption) Type() OptionType { return QueueOpt }
+func (name flowIDOption) Value() any       { return string(name) }
 
 // TaskID returns an option to specify the task ID.
 func TaskID(id string) Option {
 	return taskIDOption(id)
 }
 
-func (id taskIDOption) String() string     { return fmt.Sprintf("TaskID(%q)", string(id)) }
-func (id taskIDOption) Type() OptionType   { return TaskIDOpt }
-func (id taskIDOption) Value() interface{} { return string(id) }
+func (id taskIDOption) String() string   { return fmt.Sprintf("TaskID(%q)", string(id)) }
+func (id taskIDOption) Type() OptionType { return TaskIDOpt }
+func (id taskIDOption) Value() any       { return string(id) }
 
 // Timeout returns an option to specify how long a task may run.
 // If the timeout elapses before the Handler returns, then the task
@@ -122,9 +141,9 @@ func Timeout(d time.Duration) Option {
 	return timeoutOption(d)
 }
 
-func (d timeoutOption) String() string     { return fmt.Sprintf("Timeout(%v)", time.Duration(d)) }
-func (d timeoutOption) Type() OptionType   { return TimeoutOpt }
-func (d timeoutOption) Value() interface{} { return time.Duration(d) }
+func (d timeoutOption) String() string   { return fmt.Sprintf("Timeout(%v)", time.Duration(d)) }
+func (d timeoutOption) Type() OptionType { return TimeoutOpt }
+func (d timeoutOption) Value() any       { return time.Duration(d) }
 
 // Deadline returns an option to specify the deadline for the given task.
 // If it reaches the deadline before the Handler returns, then the task
@@ -139,8 +158,8 @@ func Deadline(t time.Time) Option {
 func (t deadlineOption) String() string {
 	return fmt.Sprintf("Deadline(%v)", time.Time(t).Format(time.UnixDate))
 }
-func (t deadlineOption) Type() OptionType   { return DeadlineOpt }
-func (t deadlineOption) Value() interface{} { return time.Time(t) }
+func (t deadlineOption) Type() OptionType { return DeadlineOpt }
+func (t deadlineOption) Value() any       { return time.Time(t) }
 
 // Unique returns an option to enqueue a task only if the given task is unique.
 // Task enqueued with this option is guaranteed to be unique within the given ttl.
@@ -150,16 +169,16 @@ func (t deadlineOption) Value() interface{} { return time.Time(t) }
 // TTL duration must be greater than or equal to 1 second.
 //
 // Uniqueness of a task is based on the following properties:
-//     - Task Type
-//     - Task Payload
-//     - Queue Name
+//   - Task Type
+//   - Task Payload
+//   - Queue Name
 func Unique(ttl time.Duration) Option {
 	return uniqueOption(ttl)
 }
 
-func (ttl uniqueOption) String() string     { return fmt.Sprintf("Unique(%v)", time.Duration(ttl)) }
-func (ttl uniqueOption) Type() OptionType   { return UniqueOpt }
-func (ttl uniqueOption) Value() interface{} { return time.Duration(ttl) }
+func (ttl uniqueOption) String() string   { return fmt.Sprintf("Unique(%v)", time.Duration(ttl)) }
+func (ttl uniqueOption) Type() OptionType { return UniqueOpt }
+func (ttl uniqueOption) Value() any       { return time.Duration(ttl) }
 
 // ProcessAt returns an option to specify when to process the given task.
 //
@@ -171,8 +190,8 @@ func ProcessAt(t time.Time) Option {
 func (t processAtOption) String() string {
 	return fmt.Sprintf("ProcessAt(%v)", time.Time(t).Format(time.UnixDate))
 }
-func (t processAtOption) Type() OptionType   { return ProcessAtOpt }
-func (t processAtOption) Value() interface{} { return time.Time(t) }
+func (t processAtOption) Type() OptionType { return ProcessAtOpt }
+func (t processAtOption) Value() any       { return time.Time(t) }
 
 // ProcessIn returns an option to specify when to process the given task relative to the current time.
 //
@@ -181,9 +200,9 @@ func ProcessIn(d time.Duration) Option {
 	return processInOption(d)
 }
 
-func (d processInOption) String() string     { return fmt.Sprintf("ProcessIn(%v)", time.Duration(d)) }
-func (d processInOption) Type() OptionType   { return ProcessInOpt }
-func (d processInOption) Value() interface{} { return time.Duration(d) }
+func (d processInOption) String() string   { return fmt.Sprintf("ProcessIn(%v)", time.Duration(d)) }
+func (d processInOption) Type() OptionType { return ProcessInOpt }
+func (d processInOption) Value() any       { return time.Duration(d) }
 
 // Retention returns an option to specify the duration of retention period for the task.
 // If this option is provided, the task will be stored as a completed task after successful processing.
@@ -192,9 +211,9 @@ func Retention(d time.Duration) Option {
 	return retentionOption(d)
 }
 
-func (ttl retentionOption) String() string     { return fmt.Sprintf("Retention(%v)", time.Duration(ttl)) }
-func (ttl retentionOption) Type() OptionType   { return RetentionOpt }
-func (ttl retentionOption) Value() interface{} { return time.Duration(ttl) }
+func (ttl retentionOption) String() string   { return fmt.Sprintf("Retention(%v)", time.Duration(ttl)) }
+func (ttl retentionOption) Type() OptionType { return RetentionOpt }
+func (ttl retentionOption) Value() any       { return time.Duration(ttl) }
 
 // Group returns an option to specify the group used for the task.
 // Tasks in a given queue with the same group will be aggregated into one task before passed to Handler.
@@ -202,9 +221,9 @@ func Group(name string) Option {
 	return groupOption(name)
 }
 
-func (name groupOption) String() string     { return fmt.Sprintf("Group(%q)", string(name)) }
-func (name groupOption) Type() OptionType   { return GroupOpt }
-func (name groupOption) Value() interface{} { return string(name) }
+func (name groupOption) String() string   { return fmt.Sprintf("Group(%q)", string(name)) }
+func (name groupOption) Type() OptionType { return GroupOpt }
+func (name groupOption) Value() any       { return string(name) }
 
 // ErrDuplicateTask indicates that the given task could not be enqueued since it's a duplicate of another task.
 //
@@ -219,6 +238,7 @@ var ErrTaskIDConflict = errors.New("task ID conflicts with another task")
 type option struct {
 	retry     int
 	queue     string
+	flowID    string
 	taskID    string
 	timeout   time.Duration
 	deadline  time.Time
@@ -236,7 +256,8 @@ func composeOptions(opts ...Option) (option, error) {
 	res := option{
 		retry:     defaultMaxRetry,
 		queue:     base.DefaultQueueName,
-		taskID:    uuid.NewString(),
+		flowID:    "",
+		taskID:    xid.New().String(),
 		timeout:   0, // do not set to defaultTimeout here
 		deadline:  time.Time{},
 		processAt: time.Now(),
@@ -251,6 +272,8 @@ func composeOptions(opts ...Option) (option, error) {
 				return option{}, err
 			}
 			res.queue = qname
+		case flowIDOption:
+			res.flowID = string(opt)
 		case taskIDOption:
 			id := string(opt)
 			if isBlank(id) {
@@ -339,6 +362,10 @@ func (c *Client) Enqueue(task *Task, opts ...Option) (*TaskInfo, error) {
 //
 // The first argument context applies to the enqueue operation. To specify task timeout and deadline, use Timeout and Deadline option instead.
 func (c *Client) EnqueueContext(ctx context.Context, task *Task, opts ...Option) (*TaskInfo, error) {
+	return EnqueueContext(c.broker, ctx, task, opts...)
+}
+
+func EnqueueContext(broker base.Broker, ctx context.Context, task *Task, opts ...Option) (*TaskInfo, error) {
 	if task == nil {
 		return nil, fmt.Errorf("task cannot be nil")
 	}
@@ -372,6 +399,7 @@ func (c *Client) EnqueueContext(ctx context.Context, task *Task, opts ...Option)
 		Type:      task.Type(),
 		Payload:   task.Payload(),
 		Queue:     opt.queue,
+		FlowID:    opt.flowID,
 		Retry:     opt.retry,
 		Deadline:  deadline.Unix(),
 		Timeout:   int64(timeout.Seconds()),
@@ -382,16 +410,16 @@ func (c *Client) EnqueueContext(ctx context.Context, task *Task, opts ...Option)
 	now := time.Now()
 	var state base.TaskState
 	if opt.processAt.After(now) {
-		err = c.schedule(ctx, msg, opt.processAt, opt.uniqueTTL)
+		err = schedule(broker, ctx, msg, opt.processAt, opt.uniqueTTL)
 		state = base.TaskStateScheduled
 	} else if opt.group != "" {
 		// Use zero value for processAt since we don't know when the task will be aggregated and processed.
 		opt.processAt = time.Time{}
-		err = c.addToGroup(ctx, msg, opt.group, opt.uniqueTTL)
+		err = addToGroup(broker, ctx, msg, opt.group, opt.uniqueTTL)
 		state = base.TaskStateAggregating
 	} else {
 		opt.processAt = now
-		err = c.enqueue(ctx, msg, opt.uniqueTTL)
+		err = enqueue(broker, ctx, msg, opt.uniqueTTL)
 		state = base.TaskStatePending
 	}
 	switch {
@@ -406,23 +434,35 @@ func (c *Client) EnqueueContext(ctx context.Context, task *Task, opts ...Option)
 }
 
 func (c *Client) enqueue(ctx context.Context, msg *base.TaskMessage, uniqueTTL time.Duration) error {
-	if uniqueTTL > 0 {
-		return c.broker.EnqueueUnique(ctx, msg, uniqueTTL)
-	}
-	return c.broker.Enqueue(ctx, msg)
+	return enqueue(c.broker, ctx, msg, uniqueTTL)
 }
 
 func (c *Client) schedule(ctx context.Context, msg *base.TaskMessage, t time.Time, uniqueTTL time.Duration) error {
-	if uniqueTTL > 0 {
-		ttl := t.Add(uniqueTTL).Sub(time.Now())
-		return c.broker.ScheduleUnique(ctx, msg, t, ttl)
-	}
-	return c.broker.Schedule(ctx, msg, t)
+	return schedule(c.broker, ctx, msg, t, uniqueTTL)
 }
 
 func (c *Client) addToGroup(ctx context.Context, msg *base.TaskMessage, group string, uniqueTTL time.Duration) error {
+	return addToGroup(c.broker, ctx, msg, group, uniqueTTL)
+}
+
+func enqueue(broker base.Broker, ctx context.Context, msg *base.TaskMessage, uniqueTTL time.Duration) error {
 	if uniqueTTL > 0 {
-		return c.broker.AddToGroupUnique(ctx, msg, group, uniqueTTL)
+		return broker.EnqueueUnique(ctx, msg, uniqueTTL)
 	}
-	return c.broker.AddToGroup(ctx, msg, group)
+	return broker.Enqueue(ctx, msg)
+}
+
+func schedule(broker base.Broker, ctx context.Context, msg *base.TaskMessage, t time.Time, uniqueTTL time.Duration) error {
+	if uniqueTTL > 0 {
+		ttl := t.Add(uniqueTTL).Sub(time.Now())
+		return broker.ScheduleUnique(ctx, msg, t, ttl)
+	}
+	return broker.Schedule(ctx, msg, t)
+}
+
+func addToGroup(broker base.Broker, ctx context.Context, msg *base.TaskMessage, group string, uniqueTTL time.Duration) error {
+	if uniqueTTL > 0 {
+		return broker.AddToGroupUnique(ctx, msg, group, uniqueTTL)
+	}
+	return broker.AddToGroup(ctx, msg, group)
 }

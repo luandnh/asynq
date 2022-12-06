@@ -46,6 +46,10 @@ func (tb *TestBroker) Wakeup() {
 	tb.sleeping = false
 }
 
+func (tb *TestBroker) GetTaskInfo(queue, id string) (*base.TaskInfo, error) {
+	return nil, nil
+}
+
 func (tb *TestBroker) Enqueue(ctx context.Context, msg *base.TaskMessage) error {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
@@ -235,6 +239,14 @@ func (tb *TestBroker) Close() error {
 	return tb.real.Close()
 }
 
+func (tb *TestBroker) AddTask(key string, data []byte) error {
+	return nil
+}
+
+func (tb *TestBroker) GetTask(key string) ([]byte, error) {
+	return nil, nil
+}
+
 func (tb *TestBroker) AddToGroup(ctx context.Context, msg *base.TaskMessage, gname string) error {
 	tb.mu.Lock()
 	defer tb.mu.Unlock()
@@ -296,4 +308,12 @@ func (tb *TestBroker) ReclaimStaleAggregationSets(qname string) error {
 		return errRedisDown
 	}
 	return tb.real.ReclaimStaleAggregationSets(qname)
+}
+
+func (tb *TestBroker) Pause(qname string) error {
+	return nil
+}
+
+func (tb *TestBroker) Unpause(qname string) error {
+	return nil
 }

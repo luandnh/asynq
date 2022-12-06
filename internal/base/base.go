@@ -237,6 +237,9 @@ type TaskMessage struct {
 	// Type indicates the kind of the task to be performed.
 	Type string
 
+	// FlowID indicates the kind of the task to be performed.
+	FlowID string
+
 	// Payload holds data needed to process the task.
 	Payload []byte
 
@@ -306,6 +309,7 @@ func EncodeMessage(msg *TaskMessage) ([]byte, error) {
 		Payload:      msg.Payload,
 		Id:           msg.ID,
 		Queue:        msg.Queue,
+		FlowId:       msg.FlowID,
 		Retry:        int32(msg.Retry),
 		Retried:      int32(msg.Retried),
 		ErrorMsg:     msg.ErrorMsg,
@@ -330,6 +334,7 @@ func DecodeMessage(data []byte) (*TaskMessage, error) {
 		Payload:      pbmsg.GetPayload(),
 		ID:           pbmsg.GetId(),
 		Queue:        pbmsg.GetQueue(),
+		FlowID:       pbmsg.GetFlowId(),
 		Retry:        int(pbmsg.GetRetry()),
 		Retried:      int(pbmsg.GetRetried()),
 		ErrorMsg:     pbmsg.GetErrorMsg(),
@@ -715,6 +720,9 @@ func (l *Lease) IsValid() bool {
 type Broker interface {
 	Ping() error
 	Close() error
+	GetTaskInfo(queue, id string) (*TaskInfo, error)
+	AddTask(key string, data []byte) error
+	GetTask(key string) ([]byte, error)
 	Enqueue(ctx context.Context, msg *TaskMessage) error
 	EnqueueUnique(ctx context.Context, msg *TaskMessage, ttl time.Duration) error
 	Dequeue(qnames ...string) (*TaskMessage, time.Time, error)
@@ -726,6 +734,8 @@ type Broker interface {
 	Retry(ctx context.Context, msg *TaskMessage, processAt time.Time, errMsg string, isFailure bool) error
 	Archive(ctx context.Context, msg *TaskMessage, errMsg string) error
 	ForwardIfReady(qnames ...string) error
+	Pause(qname string) error
+	Unpause(qname string) error
 
 	// Group aggregation related methods
 	AddToGroup(ctx context.Context, msg *TaskMessage, gname string) error

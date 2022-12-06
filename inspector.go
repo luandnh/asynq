@@ -33,6 +33,13 @@ func NewInspector(r RedisConnOpt) *Inspector {
 	}
 }
 
+// NewInspectorFromRDB returns a new instance of Inspector.
+func NewInspectorFromRDB(rd *rdb.RDB) *Inspector {
+	return &Inspector{
+		rdb: rd,
+	}
+}
+
 // Close closes the connection with redis.
 func (i *Inspector) Close() error {
 	return i.rdb.Close()

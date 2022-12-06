@@ -6,6 +6,7 @@ package asynq
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -46,13 +47,25 @@ func NewServeMux() *ServeMux {
 
 // ProcessTask dispatches the task to the handler whose
 // pattern most closely matches the task type.
-func (mux *ServeMux) ProcessTask(ctx context.Context, task *Task) error {
+func (mux *ServeMux) ProcessTask(ctx context.Context, task *Task) Result {
 	h, _ := mux.Handler(task)
 	return h.ProcessTask(ctx, task)
 }
 
+// GetType dispatches the task to the handler whose
+// pattern most closely matches the task type.
+func (mux *ServeMux) GetType() string {
+	return "handler"
+}
+
+// GetKey dispatches the task to the handler whose
+// pattern most closely matches the task type.
+func (mux *ServeMux) GetKey() string {
+	return ""
+}
+
 // Handler returns the handler to use for the given task.
-// It always return a non-nil handler.
+// It always returns a non-nil handler.
 //
 // Handler also returns the registered pattern that matches the task.
 //
@@ -94,18 +107,27 @@ func (mux *ServeMux) match(typename string) (h Handler, pattern string) {
 
 // Handle registers the handler for the given pattern.
 // If a handler already exists for pattern, Handle panics.
-func (mux *ServeMux) Handle(pattern string, handler Handler) {
+func (mux *ServeMux) Handle(pattern string, handler Handler) Result {
 	mux.mu.Lock()
 	defer mux.mu.Unlock()
 
 	if strings.TrimSpace(pattern) == "" {
-		panic("asynq: invalid pattern")
+		return Result{
+			Data:  nil,
+			Error: errors.New("asynq: invalid pattern"),
+		}
 	}
 	if handler == nil {
-		panic("asynq: nil handler")
+		return Result{
+			Data:  nil,
+			Error: errors.New("asynq: nil handler"),
+		}
 	}
 	if _, exist := mux.m[pattern]; exist {
-		panic("asynq: multiple registrations for " + pattern)
+		return Result{
+			Data:  nil,
+			Error: errors.New("asynq: multiple registrations for " + pattern),
+		}
 	}
 
 	if mux.m == nil {
@@ -114,6 +136,7 @@ func (mux *ServeMux) Handle(pattern string, handler Handler) {
 	e := muxEntry{h: handler, pattern: pattern}
 	mux.m[pattern] = e
 	mux.es = appendSorted(mux.es, e)
+	return Result{}
 }
 
 func appendSorted(es []muxEntry, e muxEntry) []muxEntry {
@@ -132,11 +155,14 @@ func appendSorted(es []muxEntry, e muxEntry) []muxEntry {
 }
 
 // HandleFunc registers the handler function for the given pattern.
-func (mux *ServeMux) HandleFunc(pattern string, handler func(context.Context, *Task) error) {
+func (mux *ServeMux) HandleFunc(pattern string, handler func(context.Context, *Task) Result) Result {
 	if handler == nil {
-		panic("asynq: nil handler")
+		return Result{
+			Data:  nil,
+			Error: errors.New("asynq: nil handler"),
+		}
 	}
-	mux.Handle(pattern, HandlerFunc(handler))
+	return mux.Handle(pattern, HandlerFunc(handler))
 }
 
 // Use appends a MiddlewareFunc to the chain.
@@ -150,9 +176,12 @@ func (mux *ServeMux) Use(mws ...MiddlewareFunc) {
 }
 
 // NotFound returns an error indicating that the handler was not found for the given task.
-func NotFound(ctx context.Context, task *Task) error {
-	return fmt.Errorf("handler not found for task %q", task.Type())
+func NotFound(ctx context.Context, task *Task) Result {
+	return Result{
+		Data:  nil,
+		Error: fmt.Errorf("handler not found for task %q", task.Type()),
+	}
 }
 
-// NotFoundHandler returns a simple task handler that returns a ``not found`` error.
+// NotFoundHandler returns a simple task handler that returns a “not found“ error.
 func NotFoundHandler() Handler { return HandlerFunc(NotFound) }

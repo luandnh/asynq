@@ -22,6 +22,8 @@ import (
 type Task struct {
 	// typename indicates the type of task to be performed.
 	typename string
+	// FlowID indicates the type of task to be performed.
+	FlowID string
 
 	// payload holds data needed to perform the task.
 	payload []byte
@@ -42,22 +44,38 @@ func (t *Task) Payload() []byte { return t.payload }
 // Only the tasks passed to Handler.ProcessTask have a valid ResultWriter pointer.
 func (t *Task) ResultWriter() *ResultWriter { return t.w }
 
+func (t *Task) Options() []Option { return t.opts }
+
 // NewTask returns a new Task given a type name and payload data.
 // Options can be passed to configure task processing behavior.
 func NewTask(typename string, payload []byte, opts ...Option) *Task {
+	var f string
+	for _, opt := range opts {
+		switch flowID := opt.(type) {
+		case flowIDOption:
+			f = flowID.String()
+			break
+		}
+	}
 	return &Task{
 		typename: typename,
 		payload:  payload,
 		opts:     opts,
+		FlowID:   f,
 	}
 }
 
 // newTask creates a task with the given typename, payload and ResultWriter.
-func newTask(typename string, payload []byte, w *ResultWriter) *Task {
+func newTask(typename string, payload []byte, w *ResultWriter, flowID ...string) *Task {
+	var f string
+	if len(flowID) > 0 {
+		f = flowID[0]
+	}
 	return &Task{
 		typename: typename,
 		payload:  payload,
 		w:        w,
+		FlowID:   f,
 	}
 }
 
@@ -68,6 +86,9 @@ type TaskInfo struct {
 
 	// Queue is the name of the queue in which the task belongs.
 	Queue string
+
+	// FlowID is the name of the queue in which the task belongs.
+	FlowID string
 
 	// Type is the type name of the task.
 	Type string
@@ -143,6 +164,7 @@ func newTaskInfo(msg *base.TaskMessage, state base.TaskState, nextProcessAt time
 	info := TaskInfo{
 		ID:            msg.ID,
 		Queue:         msg.Queue,
+		FlowID:        msg.FlowID,
 		Type:          msg.Type,
 		Payload:       msg.Payload, // Do we need to make a copy?
 		MaxRetry:      msg.Retry,
@@ -235,7 +257,7 @@ func (s TaskState) String() string {
 type RedisConnOpt interface {
 	// MakeRedisClient returns a new redis client instance.
 	// Return value is intentionally opaque to hide the implementation detail of redis client.
-	MakeRedisClient() interface{}
+	MakeRedisClient() any
 }
 
 // RedisClientOpt is used to create a redis client that connects
@@ -289,7 +311,7 @@ type RedisClientOpt struct {
 	TLSConfig *tls.Config
 }
 
-func (opt RedisClientOpt) MakeRedisClient() interface{} {
+func (opt RedisClientOpt) MakeRedisClient() any {
 	return redis.NewClient(&redis.Options{
 		Network:      opt.Network,
 		Addr:         opt.Addr,
@@ -360,7 +382,7 @@ type RedisFailoverClientOpt struct {
 	TLSConfig *tls.Config
 }
 
-func (opt RedisFailoverClientOpt) MakeRedisClient() interface{} {
+func (opt RedisFailoverClientOpt) MakeRedisClient() any {
 	return redis.NewFailoverClient(&redis.FailoverOptions{
 		MasterName:       opt.MasterName,
 		SentinelAddrs:    opt.SentinelAddrs,
@@ -420,7 +442,7 @@ type RedisClusterClientOpt struct {
 	TLSConfig *tls.Config
 }
 
-func (opt RedisClusterClientOpt) MakeRedisClient() interface{} {
+func (opt RedisClusterClientOpt) MakeRedisClient() any {
 	return redis.NewClusterClient(&redis.ClusterOptions{
 		Addrs:        opt.Addrs,
 		MaxRedirects: opt.MaxRedirects,
@@ -438,10 +460,11 @@ func (opt RedisClusterClientOpt) MakeRedisClient() interface{} {
 //
 // Three URI schemes are supported, which are redis:, rediss:, redis-socket:, and redis-sentinel:.
 // Supported formats are:
-//     redis://[:password@]host[:port][/dbnumber]
-//     rediss://[:password@]host[:port][/dbnumber]
-//     redis-socket://[:password@]path[?db=dbnumber]
-//     redis-sentinel://[:password@]host1[:port][,host2:[:port]][,hostN:[:port]][?master=masterName]
+//
+//	redis://[:password@]host[:port][/dbnumber]
+//	rediss://[:password@]host[:port][/dbnumber]
+//	redis-socket://[:password@]path[?db=dbnumber]
+//	redis-sentinel://[:password@]host1[:port][,host2:[:port]][,hostN:[:port]][?master=masterName]
 func ParseRedisURI(uri string) (RedisConnOpt, error) {
 	u, err := url.Parse(uri)
 	if err != nil {
@@ -527,6 +550,7 @@ func parseRedisSentinelURI(u *url.URL) (RedisConnOpt, error) {
 type ResultWriter struct {
 	id     string // task ID this writer is responsible for
 	qname  string // queue name the task belongs to
+	flowID string // queue name the task belongs to
 	broker base.Broker
 	ctx    context.Context // context associated with the task
 }
@@ -544,4 +568,12 @@ func (w *ResultWriter) Write(data []byte) (n int, err error) {
 // TaskID returns the ID of the task the ResultWriter is associated with.
 func (w *ResultWriter) TaskID() string {
 	return w.id
+}
+
+func (w *ResultWriter) Broker() base.Broker {
+	return w.broker
+}
+
+func (w *ResultWriter) FlowID() string {
+	return w.flowID
 }

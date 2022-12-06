@@ -9,10 +9,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
-	"runtime"
-	"runtime/debug"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -25,95 +22,81 @@ import (
 )
 
 type processor struct {
-	logger *log.Logger
-	broker base.Broker
-	clock  timeutil.Clock
-
-	handler   Handler
-	baseCtxFn func() context.Context
-
-	queueConfig map[string]int
-
-	// orderedQueues is set only in strict-priority mode.
-	orderedQueues []string
-
-	retryDelayFunc RetryDelayFunc
-	isFailureFunc  func(error) bool
-
-	errHandler ErrorHandler
-
-	shutdownTimeout time.Duration
-
-	// channel via which to send sync requests to syncer.
-	syncRequestCh chan<- *syncRequest
-
-	// rate limiter to prevent spamming logs with a bunch of errors.
-	errLogLimiter *rate.Limiter
-
-	// sema is a counting semaphore to ensure the number of active workers
-	// does not exceed the limit.
-	sema chan struct{}
-
-	// channel to communicate back to the long running "processor" goroutine.
-	// once is used to send value to the channel only once.
-	done chan struct{}
-	once sync.Once
-
-	// quit channel is closed when the shutdown of the "processor" goroutine starts.
-	quit chan struct{}
-
-	// abort channel communicates to the in-flight worker goroutines to stop.
-	abort chan struct{}
-
-	// cancelations is a set of cancel functions for all active tasks.
-	cancelations *base.Cancelations
-
-	starting chan<- *workerInfo
-	finished chan<- *base.TaskMessage
+	logger           *log.Logger
+	broker           base.Broker
+	clock            timeutil.Clock
+	handler          Handler
+	baseCtxFn        func() context.Context
+	queueConfig      map[string]int
+	orderedQueues    []string
+	retryDelayFunc   RetryDelayFunc
+	isFailureFunc    func(error) bool
+	errHandler       ErrorHandler
+	completeHandler  CompleteHandler
+	doneHandler      DoneHandler
+	recoverPanicFunc RecoverPanicFunc
+	shutdownTimeout  time.Duration
+	syncRequestCh    chan<- *syncRequest
+	errLogLimiter    *rate.Limiter
+	sema             chan struct{}
+	done             chan struct{}
+	once             sync.Once
+	quit             chan struct{}
+	abort            chan struct{}
+	cancelations     *base.Cancelations
+	starting         chan<- *workerInfo
+	finished         chan<- *base.TaskMessage
 }
 
 type processorParams struct {
-	logger          *log.Logger
-	broker          base.Broker
-	baseCtxFn       func() context.Context
-	retryDelayFunc  RetryDelayFunc
-	isFailureFunc   func(error) bool
-	syncCh          chan<- *syncRequest
-	cancelations    *base.Cancelations
-	concurrency     int
-	queues          map[string]int
-	strictPriority  bool
-	errHandler      ErrorHandler
-	shutdownTimeout time.Duration
-	starting        chan<- *workerInfo
-	finished        chan<- *base.TaskMessage
+	logger           *log.Logger
+	broker           base.Broker
+	baseCtxFn        func() context.Context
+	retryDelayFunc   RetryDelayFunc
+	recoverPanicFunc RecoverPanicFunc
+	isFailureFunc    func(error) bool
+	syncCh           chan<- *syncRequest
+	cancelations     *base.Cancelations
+	concurrency      int
+	queues           map[string]int
+	strictPriority   bool
+	errHandler       ErrorHandler
+	completeHandler  CompleteHandler
+	doneHandler      DoneHandler
+	shutdownTimeout  time.Duration
+	starting         chan<- *workerInfo
+	finished         chan<- *base.TaskMessage
 }
 
 // newProcessor constructs a new processor.
 func newProcessor(params processorParams) *processor {
-	queues := normalizeQueues(params.queues)
-	orderedQueues := []string(nil)
-	if params.strictPriority {
-		orderedQueues = sortByPriority(queues)
-	}
+	queues, orderedQueues := prepareQueues(params.queues, params.strictPriority)
 	return &processor{
-		logger:          params.logger,
-		broker:          params.broker,
-		baseCtxFn:       params.baseCtxFn,
-		clock:           timeutil.NewRealClock(),
-		queueConfig:     queues,
-		orderedQueues:   orderedQueues,
-		retryDelayFunc:  params.retryDelayFunc,
-		isFailureFunc:   params.isFailureFunc,
-		syncRequestCh:   params.syncCh,
-		cancelations:    params.cancelations,
-		errLogLimiter:   rate.NewLimiter(rate.Every(3*time.Second), 1),
-		sema:            make(chan struct{}, params.concurrency),
-		done:            make(chan struct{}),
-		quit:            make(chan struct{}),
-		abort:           make(chan struct{}),
-		errHandler:      params.errHandler,
-		handler:         HandlerFunc(func(ctx context.Context, t *Task) error { return fmt.Errorf("handler not set") }),
+		logger:           params.logger,
+		broker:           params.broker,
+		baseCtxFn:        params.baseCtxFn,
+		clock:            timeutil.NewRealClock(),
+		queueConfig:      queues,
+		orderedQueues:    orderedQueues,
+		retryDelayFunc:   params.retryDelayFunc,
+		recoverPanicFunc: params.recoverPanicFunc,
+		isFailureFunc:    params.isFailureFunc,
+		syncRequestCh:    params.syncCh,
+		cancelations:     params.cancelations,
+		errLogLimiter:    rate.NewLimiter(rate.Every(3*time.Second), 1),
+		sema:             make(chan struct{}, params.concurrency),
+		done:             make(chan struct{}),
+		quit:             make(chan struct{}),
+		abort:            make(chan struct{}),
+		errHandler:       params.errHandler,
+		completeHandler:  params.completeHandler,
+		doneHandler:      params.doneHandler,
+		handler: HandlerFunc(func(ctx context.Context, t *Task) Result {
+			return Result{
+				Data:  nil,
+				Error: fmt.Errorf("handler not set"),
+			}
+		}),
 		shutdownTimeout: params.shutdownTimeout,
 		starting:        params.starting,
 		finished:        params.finished,
@@ -179,7 +162,7 @@ func (p *processor) exec() {
 			// Sleep to avoid slamming redis and let scheduler move tasks into queues.
 			// Note: We are not using blocking pop operation and polling queues instead.
 			// This adds significant load to redis.
-			time.Sleep(time.Second)
+			time.Sleep(100 * time.Millisecond)
 			<-p.sema // release token
 			return
 		case err != nil:
@@ -215,7 +198,7 @@ func (p *processor) exec() {
 			default:
 			}
 
-			resCh := make(chan error, 1)
+			resCh := make(chan Result, 1)
 			go func() {
 				task := newTask(
 					msg.Type,
@@ -226,6 +209,7 @@ func (p *processor) exec() {
 						broker: p.broker,
 						ctx:    ctx,
 					},
+					msg.FlowID,
 				)
 				resCh <- p.perform(ctx, task)
 			}()
@@ -244,11 +228,11 @@ func (p *processor) exec() {
 				p.handleFailedMessage(ctx, lease, msg, ctx.Err())
 				return
 			case resErr := <-resCh:
-				if resErr != nil {
-					p.handleFailedMessage(ctx, lease, msg, resErr)
+				if resErr.Error != nil {
+					p.handleFailedMessage(ctx, lease, msg, resErr.Error, resErr.Data)
 					return
 				}
-				p.handleSucceededMessage(lease, msg)
+				p.handleSucceededMessage(ctx, lease, msg, resErr.Data)
 			}
 		}()
 	}
@@ -268,10 +252,22 @@ func (p *processor) requeue(l *base.Lease, msg *base.TaskMessage) {
 	}
 }
 
-func (p *processor) handleSucceededMessage(l *base.Lease, msg *base.TaskMessage) {
+func (p *processor) handleSucceededMessage(ctx context.Context, l *base.Lease, msg *base.TaskMessage, result ...[]byte) {
+	var data []byte
+	if len(result) > 0 {
+		data = result[0]
+	} else {
+		data = msg.Payload
+	}
 	if msg.Retention > 0 {
+		if p.completeHandler != nil {
+			p.completeHandler.HandleComplete(ctx, NewTask(msg.Type, data, FlowID(msg.FlowID), TaskID(msg.ID)))
+		}
 		p.markAsComplete(l, msg)
 	} else {
+		if p.doneHandler != nil {
+			p.doneHandler.HandleDone(ctx, NewTask(msg.Type, data, FlowID(msg.FlowID), TaskID(msg.ID)))
+		}
 		p.markAsDone(l, msg)
 	}
 }
@@ -321,9 +317,15 @@ func (p *processor) markAsDone(l *base.Lease, msg *base.TaskMessage) {
 // the task should not be retried and should be archived instead.
 var SkipRetry = errors.New("skip retry for the task")
 
-func (p *processor) handleFailedMessage(ctx context.Context, l *base.Lease, msg *base.TaskMessage, err error) {
+func (p *processor) handleFailedMessage(ctx context.Context, l *base.Lease, msg *base.TaskMessage, err error, result ...[]byte) {
+	var data []byte
+	if len(result) > 0 {
+		data = result[0]
+	} else {
+		data = msg.Payload
+	}
 	if p.errHandler != nil {
-		p.errHandler.HandleError(ctx, NewTask(msg.Type, msg.Payload), err)
+		p.errHandler.HandleError(ctx, NewTask(msg.Type, data, FlowID(msg.FlowID), TaskID(msg.ID)), err)
 	}
 	if !p.isFailureFunc(err) {
 		// retry the task without marking it as failed
@@ -410,10 +412,14 @@ func (p *processor) queues() []string {
 // perform calls the handler with the given task.
 // If the call returns without panic, it simply returns the value,
 // otherwise, it recovers from panic and returns an error.
-func (p *processor) perform(ctx context.Context, task *Task) (err error) {
-	defer func() {
+func (p *processor) perform(ctx context.Context, task *Task) (result Result) {
+	/*defer func() {
 		if x := recover(); x != nil {
-			p.logger.Errorf("recovering from panic. See the stack trace below for details:\n%s", string(debug.Stack()))
+			errMsg := string(debug.Stack())
+			if p.recoverPanicFunc != nil {
+				p.recoverPanicFunc(errMsg)
+			}
+			p.logger.Errorf("recovering from panic. See the stack trace below for details:\n%s", errMsg)
 			_, file, line, ok := runtime.Caller(1) // skip the first frame (panic itself)
 			if ok && strings.Contains(file, "runtime/") {
 				// The panic came from the runtime, most likely due to incorrect
@@ -423,12 +429,12 @@ func (p *processor) perform(ctx context.Context, task *Task) (err error) {
 
 			// Include the file and line number info in the error, if runtime.Caller returned ok.
 			if ok {
-				err = fmt.Errorf("panic [%s:%d]: %v", file, line, x)
+				result.Error = fmt.Errorf("panic [%s:%d]: %v", file, line, x)
 			} else {
-				err = fmt.Errorf("panic: %v", x)
+				result.Error = fmt.Errorf("panic: %v", x)
 			}
 		}
-	}()
+	}()*/
 	return p.handler.ProcessTask(ctx, task)
 }
 

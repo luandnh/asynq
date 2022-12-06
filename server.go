@@ -6,6 +6,7 @@ package asynq
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -19,6 +20,7 @@ import (
 	"github.com/hibiken/asynq/internal/base"
 	"github.com/hibiken/asynq/internal/log"
 	"github.com/hibiken/asynq/internal/rdb"
+	"github.com/rs/xid"
 )
 
 // Server is responsible for task processing and task lifecycle management.
@@ -34,11 +36,16 @@ import (
 // Note that the archive size is finite and once it reaches its max size,
 // oldest tasks in the archive will be deleted.
 type Server struct {
-	logger *log.Logger
+	ServerId    string
+	queues      map[string]int
+	handler     *ServeMux
+	concurrency int
+	logger      *log.Logger
 
 	broker base.Broker
 
-	state *serverState
+	state          *serverState
+	strictPriority bool
 
 	// wait group to wait for all goroutines to finish.
 	wg            sync.WaitGroup
@@ -92,6 +99,12 @@ func (s serverStateValue) String() string {
 
 // Config specifies the server's background-task processing behavior.
 type Config struct {
+	RedisClientOpt RedisClientOpt `json:"redis_opt"`
+	RDB            *rdb.RDB
+	Mode           Mode   `json:"mode"`
+	NoService      bool   `json:"no_service"`
+	FlowID         string `json:"flow_id"`
+	FlowPrefix     string `json:"flow_prefix"`
 	// Maximum number of concurrent processing of tasks.
 	//
 	// If set to a zero or negative value, NewServer will overwrite the value
@@ -145,6 +158,14 @@ type Config struct {
 	// The tasks in lower priority queues are processed only when those queues with
 	// higher priorities are empty.
 	StrictPriority bool
+	// RecoverPanicFunc will be inject some actions when workers panic.
+
+	// Example:
+
+	//     func pushPanicErrorToSentry(errMsg string) {
+	//      // perform to push error message to Sentry.
+	//     })
+	RecoverPanicFunc RecoverPanicFunc
 
 	// ErrorHandler handles errors returned by the task handler.
 	//
@@ -163,6 +184,12 @@ type Config struct {
 	//
 	//     ErrorHandler: asynq.ErrorHandlerFunc(reportError)
 	ErrorHandler ErrorHandler
+
+	CompleteHandler CompleteHandler
+
+	DoneHandler DoneHandler
+
+	CronReportHandler Handler
 
 	// Logger specifies the logger used by the server instance.
 	//
@@ -195,6 +222,8 @@ type Config struct {
 	// If unset or zero, the interval is set to 5 seconds.
 	DelayedTaskCheckInterval time.Duration
 
+	ServerID string
+
 	// GroupGracePeriod specifies the amount of time the server will wait for an incoming task before aggregating
 	// the tasks in a group. If an incoming task is received within this period, the server will wait for another
 	// period of the same length, up to GroupMaxDelay if specified.
@@ -220,6 +249,10 @@ type Config struct {
 	//
 	// If unset or nil, the group aggregation feature will be disabled on the server.
 	GroupAggregator GroupAggregator
+	idKey           string
+	statusKey       string
+	operationKey    string
+	flowIDKey       string
 }
 
 // GroupAggregator aggregates a group of tasks into one before the tasks are passed to the Handler.
@@ -256,6 +289,37 @@ func (fn ErrorHandlerFunc) HandleError(ctx context.Context, task *Task, err erro
 	fn(ctx, task, err)
 }
 
+// An CompleteHandler handles an error occurred during task processing.
+type CompleteHandler interface {
+	HandleComplete(ctx context.Context, task *Task)
+}
+
+// The CompleteHandlerFunc type is an adapter to allow the use of  ordinary functions as a CompleteHandler.
+// If f is a function with the appropriate signature, CompleteHandlerFunc(f) is a CompleteHandler that calls f.
+type CompleteHandlerFunc func(ctx context.Context, task *Task)
+
+// HandleComplete calls fn(ctx, task, err)
+func (fn CompleteHandlerFunc) HandleComplete(ctx context.Context, task *Task) {
+	fn(ctx, task)
+}
+
+// An DoneHandler handles an error occurred during task processing.
+type DoneHandler interface {
+	HandleDone(ctx context.Context, task *Task)
+}
+
+// The DoneHandlerFunc type is an adapter to allow the use of  ordinary functions as a DoneHandler.
+// If f is a function with the appropriate signature, DoneHandlerFunc(f) is a DoneHandler that calls f.
+type DoneHandlerFunc func(ctx context.Context, task *Task)
+
+// HandleDone calls fn(ctx, task, err)
+func (fn DoneHandlerFunc) HandleDone(ctx context.Context, task *Task) {
+	fn(ctx, task)
+}
+
+// RecoverPanicFunc is used to inject some actions which will be performed when workers catch panic.
+type RecoverPanicFunc func(errMsg string)
+
 // RetryDelayFunc calculates the retry delay duration for a failed task given
 // the retry count, error, and the task.
 //
@@ -267,20 +331,20 @@ type RetryDelayFunc func(n int, e error, t *Task) time.Duration
 // Logger supports logging at various log levels.
 type Logger interface {
 	// Debug logs a message at Debug level.
-	Debug(args ...interface{})
+	Debug(args ...any)
 
 	// Info logs a message at Info level.
-	Info(args ...interface{})
+	Info(args ...any)
 
 	// Warn logs a message at Warning level.
-	Warn(args ...interface{})
+	Warn(args ...any)
 
 	// Error logs a message at Error level.
-	Error(args ...interface{})
+	Error(args ...any)
 
 	// Fatal logs a message at Fatal level
 	// and process will exit with status set to 1.
-	Fatal(args ...interface{})
+	Fatal(args ...any)
 }
 
 // LogLevel represents logging level.
@@ -389,13 +453,26 @@ const (
 	defaultGroupGracePeriod = 1 * time.Minute
 )
 
+func NewRDB(cfg Config) *rdb.RDB {
+	if cfg.RDB != nil {
+		return cfg.RDB
+	}
+	if cfg.RedisClientOpt.Addr == "" {
+		cfg.RedisClientOpt = RedisClientOpt{Addr: "127.0.0.1:6379"}
+	}
+
+	c, ok := cfg.RedisClientOpt.MakeRedisClient().(redis.UniversalClient)
+	if !ok {
+		panic(fmt.Sprintf("asynq: unsupported RedisConnOpt type %T", cfg.RedisClientOpt))
+	}
+	return rdb.NewRDB(c)
+}
+
 // NewServer returns a new Server given a redis connection option
 // and server configuration.
-func NewServer(r RedisConnOpt, cfg Config) *Server {
-	c, ok := r.MakeRedisClient().(redis.UniversalClient)
-	if !ok {
-		panic(fmt.Sprintf("asynq: unsupported RedisConnOpt type %T", r))
-	}
+func NewServer(cfg Config) *Server {
+	rdb := NewRDB(cfg)
+
 	baseCtxFn := cfg.BaseContext
 	if baseCtxFn == nil {
 		baseCtxFn = context.Background
@@ -450,13 +527,18 @@ func NewServer(r RedisConnOpt, cfg Config) *Server {
 		loglevel = InfoLevel
 	}
 	logger.SetLevel(toInternalLogLevel(loglevel))
-
-	rdb := rdb.NewRDB(c)
 	starting := make(chan *workerInfo)
 	finished := make(chan *base.TaskMessage)
 	syncCh := make(chan *syncRequest)
 	srvState := &serverState{value: srvStateNew}
 	cancels := base.NewCancelations()
+
+	serverID := ""
+	if cfg.ServerID != "" {
+		serverID = cfg.ServerID
+	} else {
+		serverID = xid.New().String()
+	}
 
 	syncer := newSyncer(syncerParams{
 		logger:     logger,
@@ -469,6 +551,7 @@ func NewServer(r RedisConnOpt, cfg Config) *Server {
 		interval:       5 * time.Second,
 		concurrency:    n,
 		queues:         queues,
+		serverID:       serverID,
 		strictPriority: cfg.StrictPriority,
 		state:          srvState,
 		starting:       starting,
@@ -490,20 +573,23 @@ func NewServer(r RedisConnOpt, cfg Config) *Server {
 		cancelations: cancels,
 	})
 	processor := newProcessor(processorParams{
-		logger:          logger,
-		broker:          rdb,
-		retryDelayFunc:  delayFunc,
-		baseCtxFn:       baseCtxFn,
-		isFailureFunc:   isFailureFunc,
-		syncCh:          syncCh,
-		cancelations:    cancels,
-		concurrency:     n,
-		queues:          queues,
-		strictPriority:  cfg.StrictPriority,
-		errHandler:      cfg.ErrorHandler,
-		shutdownTimeout: shutdownTimeout,
-		starting:        starting,
-		finished:        finished,
+		logger:           logger,
+		broker:           rdb,
+		retryDelayFunc:   delayFunc,
+		baseCtxFn:        baseCtxFn,
+		recoverPanicFunc: cfg.RecoverPanicFunc,
+		isFailureFunc:    isFailureFunc,
+		syncCh:           syncCh,
+		cancelations:     cancels,
+		concurrency:      n,
+		queues:           queues,
+		strictPriority:   cfg.StrictPriority,
+		errHandler:       cfg.ErrorHandler,
+		completeHandler:  cfg.CompleteHandler,
+		doneHandler:      cfg.DoneHandler,
+		shutdownTimeout:  shutdownTimeout,
+		starting:         starting,
+		finished:         finished,
 	})
 	recoverer := newRecoverer(recovererParams{
 		logger:         logger,
@@ -535,18 +621,22 @@ func NewServer(r RedisConnOpt, cfg Config) *Server {
 		groupAggregator: cfg.GroupAggregator,
 	})
 	return &Server{
-		logger:        logger,
-		broker:        rdb,
-		state:         srvState,
-		forwarder:     forwarder,
-		processor:     processor,
-		syncer:        syncer,
-		heartbeater:   heartbeater,
-		subscriber:    subscriber,
-		recoverer:     recoverer,
-		healthchecker: healthchecker,
-		janitor:       janitor,
-		aggregator:    aggregator,
+		ServerId:       serverID,
+		strictPriority: cfg.StrictPriority,
+		queues:         queues,
+		concurrency:    n,
+		logger:         logger,
+		broker:         rdb,
+		state:          srvState,
+		forwarder:      forwarder,
+		processor:      processor,
+		syncer:         syncer,
+		heartbeater:    heartbeater,
+		subscriber:     subscriber,
+		recoverer:      recoverer,
+		healthchecker:  healthchecker,
+		janitor:        janitor,
+		aggregator:     aggregator,
 	}
 }
 
@@ -563,18 +653,44 @@ func NewServer(r RedisConnOpt, cfg Config) *Server {
 // If the returned error is SkipRetry or an error wraps SkipRetry, retry is
 // skipped and the task will be immediately archived instead.
 type Handler interface {
-	ProcessTask(context.Context, *Task) error
+	ProcessTask(context.Context, *Task) Result
+	GetType() string
+	GetKey() string
+}
+
+type Result struct {
+	Status string `json:"status"`
+	Data   []byte `json:"data"`
+	Error  error  `json:"error"`
+}
+
+func (r Result) Unmarshal(data any) error {
+	return json.Unmarshal(r.Data, data)
+}
+
+func (r Result) String() string {
+	return string(r.Data)
 }
 
 // The HandlerFunc type is an adapter to allow the use of
 // ordinary functions as a Handler. If f is a function
 // with the appropriate signature, HandlerFunc(f) is a
 // Handler that calls f.
-type HandlerFunc func(context.Context, *Task) error
+type HandlerFunc func(context.Context, *Task) Result
 
 // ProcessTask calls fn(ctx, task)
-func (fn HandlerFunc) ProcessTask(ctx context.Context, task *Task) error {
+func (fn HandlerFunc) ProcessTask(ctx context.Context, task *Task) Result {
 	return fn(ctx, task)
+}
+
+// GetType c string
+func (fn HandlerFunc) GetType() string {
+	return "server"
+}
+
+// GetKey c string
+func (fn HandlerFunc) GetKey() string {
+	return ""
 }
 
 // ErrServerClosed indicates that the operation is now illegal because of the server has been shutdown.
@@ -587,8 +703,8 @@ var ErrServerClosed = errors.New("asynq: Server closed")
 //
 // Run returns any error encountered at server startup time.
 // If the server has already been shutdown, ErrServerClosed is returned.
-func (srv *Server) Run(handler Handler) error {
-	if err := srv.Start(handler); err != nil {
+func (srv *Server) Run() error {
+	if err := srv.Start(); err != nil {
 		return err
 	}
 	srv.waitForSignals()
@@ -604,11 +720,11 @@ func (srv *Server) Run(handler Handler) error {
 //
 // Start returns any error encountered at server startup time.
 // If the server has already been shutdown, ErrServerClosed is returned.
-func (srv *Server) Start(handler Handler) error {
-	if handler == nil {
+func (srv *Server) Start() error {
+	if srv.handler == nil {
 		return fmt.Errorf("asynq: server cannot run with nil handler")
 	}
-	srv.processor.handler = handler
+	srv.processor.handler = srv.handler
 
 	if err := srv.start(); err != nil {
 		return err
@@ -696,4 +812,83 @@ func (srv *Server) Stop() {
 	srv.logger.Info("Stopping processor")
 	srv.processor.stop()
 	srv.logger.Info("Processor stopped")
+}
+
+func (srv *Server) AddHandler(handler *ServeMux) {
+	srv.handler = handler
+}
+
+func (srv *Server) AddQueueHandler(queue string, handler func(ctx context.Context, t *Task) Result) {
+	srv.handler.HandleFunc(queue, handler)
+}
+
+func (srv *Server) AddQueues(queues map[string]int) {
+	srv.queues = queues
+	for queue := range srv.queues {
+		srv.forwarder.queues = append(srv.forwarder.queues, queue)
+		srv.recoverer.queues = append(srv.recoverer.queues, queue)
+	}
+
+	srv.heartbeater.queues = srv.queues
+	srv.processor.queueConfig = srv.queues
+	ques, orderedQueues := prepareQueues(srv.processor.queueConfig, srv.strictPriority)
+	srv.processor.queueConfig = ques
+	srv.processor.orderedQueues = orderedQueues
+}
+
+func (srv *Server) AddQueue(queue string, prio ...int) {
+	priority := 0
+	if len(prio) > 0 {
+		priority = prio[0]
+	}
+	srv.queues[queue] = priority
+	srv.heartbeater.queues = srv.queues
+	srv.forwarder.queues = append(srv.forwarder.queues, queue)
+	srv.processor.queueConfig[queue] = priority
+	queues, orderedQueues := prepareQueues(srv.processor.queueConfig, srv.strictPriority)
+	srv.processor.queueConfig = queues
+	srv.processor.orderedQueues = orderedQueues
+	srv.recoverer.queues = append(srv.recoverer.queues, queue)
+}
+
+func (srv *Server) RemoveQueue(queue string) {
+	var qName []string
+	delete(srv.queues, queue)
+	for queue := range srv.queues {
+		qName = append(qName, queue)
+	}
+	srv.heartbeater.queues = srv.queues
+	srv.forwarder.queues = qName
+	srv.processor.queueConfig = srv.queues
+	queues, orderedQueues := prepareQueues(srv.processor.queueConfig, srv.strictPriority)
+	srv.processor.queueConfig = queues
+	srv.processor.orderedQueues = orderedQueues
+	srv.recoverer.queues = qName
+}
+
+func (srv *Server) HasQueue(queueName string) bool {
+	for _, que := range srv.forwarder.queues {
+		if que != queueName {
+			return true
+		}
+	}
+	return false
+}
+
+func (srv *Server) Tune(concurrency int) {
+	srv.concurrency = concurrency
+	srv.heartbeater.concurrency = concurrency
+	srv.processor.sema = make(chan struct{}, concurrency)
+}
+
+func (srv *Server) IsRunning() bool {
+	return srv.state.value == srvStateActive
+}
+
+func (srv *Server) IsStopped() bool {
+	return srv.state.value == srvStateStopped
+}
+
+func (srv *Server) IsClosed() bool {
+	return srv.state.value == srvStateClosed
 }

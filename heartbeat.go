@@ -56,6 +56,7 @@ type heartbeaterParams struct {
 	interval       time.Duration
 	concurrency    int
 	queues         map[string]int
+	serverID       string
 	strictPriority bool
 	state          *serverState
 	starting       <-chan *workerInfo
@@ -67,7 +68,9 @@ func newHeartbeater(params heartbeaterParams) *heartbeater {
 	if err != nil {
 		host = "unknown-host"
 	}
-
+	if params.serverID == "" {
+		params.serverID = uuid.NewString()
+	}
 	return &heartbeater{
 		logger:   params.logger,
 		broker:   params.broker,
@@ -77,7 +80,7 @@ func newHeartbeater(params heartbeaterParams) *heartbeater {
 
 		host:           host,
 		pid:            os.Getpid(),
-		serverID:       uuid.New().String(),
+		serverID:       params.serverID,
 		concurrency:    params.concurrency,
 		queues:         params.queues,
 		strictPriority: params.strictPriority,
