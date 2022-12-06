@@ -7,8 +7,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/hibiken/asynq/internal/base"
-	"github.com/hibiken/asynq/internal/rdb"
+	"github.com/luandnh/asynq/internal/base"
+	"github.com/luandnh/asynq/internal/rdb"
 	"github.com/rs/xid"
 	"golang.org/x/sync/errgroup"
 )
