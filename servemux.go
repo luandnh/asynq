@@ -6,6 +6,7 @@ package asynq
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -167,4 +168,15 @@ func (mux *ServeMux) GetType() string {
 // pattern most closely matches the task type.
 func (mux *ServeMux) GetKey() string {
 	return ""
+}
+
+func (mux *ServeMux) RemoveHandle(pattern string) error {
+	if mux.m == nil {
+		return errors.New("no handler registered")
+	}
+	if _, exist := mux.m[pattern]; !exist {
+		return errors.New("no handler registered for " + pattern)
+	}
+	delete(mux.m, pattern)
+	return nil
 }
