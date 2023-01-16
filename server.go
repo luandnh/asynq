@@ -817,7 +817,7 @@ func (srv *Server) RemoveQueue(queue string) {
 
 func (srv *Server) HasQueue(queueName string) bool {
 	for _, que := range srv.forwarder.queues {
-		if que != queueName {
+		if que == queueName {
 			return true
 		}
 	}
